@@ -10,7 +10,8 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-OUT = HERE / "install_dsh_termux.sh"
+# 在仓库里 shims/ 是子目录 → 生成的单文件放回仓库根
+OUT = (HERE.parent if HERE.name == "shims" else HERE) / "install_dsh_termux.sh"
 
 FILES = [
     ("dsh-shim.js", "__DSH_SHIM_JS__"),
