@@ -185,18 +185,21 @@ npm warn install-scripts  node-pty@1.2.0-beta.15 (install: node scripts/prebuild
 node-pty 在 Termux 上会触发 `node-gyp` 编译，bionic 下几乎必挂，**整个 npm install 会失败**。
 安装器已经用 `--ignore-scripts` 绕开了，node-pty 也有纯 JS 替身兜底。
 
-### ③ 配置不会被覆盖
+### ③ 任何写入都要你同意
 
-安装器是**写入保护**的：
+安装器**不会静默写任何文件**——新建和覆盖都要先点头：
 
 | 情况 | 行为 |
 |---|---|
-| 文件不存在 | 直接写 |
-| 内容相同 | 跳过 |
-| **内容不同** | **弹 y/n 问，默认 N（不写）** |
-| 没终端（管道 / cron） | 跳过，只提示 |
+| **文件不存在** | **弹 `[y/N/a]`，默认 N（新建也要同意）** |
+| 内容相同 | 跳过（本来就不用写，不打扰） |
+| **内容不同** | **弹 `[y/N/a]`，默认 N；同意后先备份再覆盖** |
+| 提问时回 `a` | 本次运行剩余文件全部同意 |
+| 没终端（管道 / cron） | 一律不写，只提示 |
 | `--reset-config` | 强制覆盖（先自动备份 `.bak.<时间戳>`） |
-| `--yes` | 跳过提问直接覆盖（先备份） |
+| `--yes` | 本次全部同意（显式传入才算） |
+
+> 一个都没同意时，安装器连 `~/.dsh-shim` 目录都不会建，并在结尾提示「有 N 个文件未写入」。
 
 改坏了想还原：删掉 `~/.dsh-shim/free-models.yml` 重跑，或 `bash install_dsh_termux.sh --reset-config`。
 
@@ -409,7 +412,7 @@ bash install_dsh_termux.sh --extract        # 只解包 shim，不安装
 bash install_dsh_termux.sh --no-key         # 不打印 Key 步骤
 bash install_dsh_termux.sh --reinstall      # 强制重装 dsh
 bash install_dsh_termux.sh --reset-config   # 强制覆盖配置（先备份）
-bash install_dsh_termux.sh --yes            # 非交互也覆盖（先备份）
+bash install_dsh_termux.sh --yes            # 本次全部同意（先备份）
 
 # 用
 dsh-termux web                    # Web UI

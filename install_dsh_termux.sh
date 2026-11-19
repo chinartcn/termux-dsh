@@ -8,6 +8,10 @@
 #     bash install_dsh_termux.sh --no-key     # 同上，但不打印 Key 步骤
 #     bash install_dsh_termux.sh --extract    # 只把内嵌的 shim 文件解出来，不安装
 #
+#  ⚠️ 写入规则：任何文件（新建或覆盖）都会先问 [y/N/a]，默认 N 不写。
+#     非交互环境（管道 / cron）没有"同意"这回事，一律跳过；
+#     --yes 表示本次全部同意（显式传入才算）。
+#
 #  本文件是**自包含**的：所有 shim 文件都内嵌在下面，无需额外传任何文件。
 #
 #  绕过的三处原生/平台依赖（都实测通过）
@@ -45,6 +49,8 @@ REINSTALL=0
 RESET_CONFIG=0
 CHECK_ONLY=0
 CONFIRM_ALL=0     # 1 = 非交互时也覆盖（默认否）
+CONSENT_ALL=0     # 1 = 本次运行中用户选择了「全部同意 a」
+SKIPPED=0         # 因未同意而跳过的文件数
 
 BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; CYA=$'\033[36m'; RST=$'\033[0m'
 say()  { echo "${CYA}▸${RST} $*"; }
@@ -64,51 +70,57 @@ for arg in "$@"; do
 done
 
 # -----------------------------------------------------------------------------
-# 写入保护：绝不覆盖你改过的文件
+# 写入保护：**任何写入都要你点头**
 # -----------------------------------------------------------------------------
 #
 # 用户明确要求：「不要写配置，要么 y/n 确认后写，要么别写。
 #                每次我改完都覆盖了。」
+# 后来收紧为：「写入文件必须同意才写入」——新建文件也一样，不能静默创建。
 #
 # 所以规则是：
-#   文件不存在            → 直接写
-#   文件存在且内容相同    → 跳过（静默）
-#   文件存在且内容不同    → **问 y/n，默认 N（不写）**
-#                          非交互场景（管道/无 TTY）→ 直接跳过，只提示
-#   --reset-config        → 跳过提问，强制覆盖
-#   --yes                 → 非交互时也覆盖
+#   文件不存在            → **问 y/N，默认 N**（新建也要同意）
+#   文件存在且内容相同    → 跳过（本来就不用写，不打扰）
+#   文件存在且内容不同    → **问 y/N，默认 N**（会先备份）
+#   非交互（管道 / cron） → 一律跳过，只提示
+#   --yes                 → 本次全部同意（显式传入才算同意）
+#   提问时可回 a          → 本次运行剩余文件全部同意
+#   --reset-config        → 强制覆盖，不问（本意就是重置）
 #
 # 备份：覆盖前一定先存一份 .bak.<时间戳>，不丢东西。
 # -----------------------------------------------------------------------------
 
-confirm_overwrite() {
-  # $1=文件路径  $2=说明
-  local target="$1" what="$2" ans=""
+ask_write() {
+  # $1=动作（新建/覆盖）  $2=说明  $3=目标路径
+  local action="$1" what="$2" target="$3" ans=""
   [ "$RESET_CONFIG" = "1" ] && return 0
-  # --yes：跳过提问直接覆盖（优先级高于交互提示）
+  # --yes：显式同意过，不再逐条问
   [ "$CONFIRM_ALL" = "1" ] && return 0
+  # 本轮已经回过 a
+  [ "$CONSENT_ALL" = "1" ] && return 0
 
-  # ⚠️ 这里不能用 `[ -t 0 ]`：write_protected 是用 heredoc 喂内容的，
-  #    heredoc 会把整个函数的 stdin 重定向成临时文件 → -t 0 永远为假。
-  #    正确做法是直接用 /dev/tty（终端设备本身，不受 stdin 重定向影响）。
-  if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+  # ⚠️ 不能用 [ -t 0 ]：heredoc 会把 stdin 重定向成临时文件 → 永远为假。
+  #    也别用 [ -r /dev/tty ]：权限可读 ≠ 真有控制终端，没终端时 open 会失败
+  #    并打出一串 "No such device or address"。直接试开一次 fd，失败就静默跳过。
+  if { exec 9<>/dev/tty; } 2>/dev/null; then
     {
-      printf "  ⚠ %s 已存在且内容不同：%s\n" "$what" "$target"
-      printf "    覆盖会丢失你的修改（会先备份）。[y/N] "
-    } > /dev/tty
-    read -r ans < /dev/tty || ans=""
+      printf "  ? %s%s → %s\n" "$action" "$what" "$target"
+      printf "    [y] 写入  [N] 跳过  [a] 本次全部同意："
+    } >&9
+    read -r ans <&9 || ans=""
+    exec 9>&-
     case "$ans" in
       y|Y|yes|YES) return 0 ;;
+      a|A|all|ALL) CONSENT_ALL=1; return 0 ;;
       *) return 1 ;;
     esac
   fi
-  # 没有终端（管道 / cron）：默认不覆盖
+  # 没有终端（管道 / cron）：没有「同意」这回事，一律不写
   return 1
 }
 
 write_protected() {
   # $1=目标文件  $2=说明（内容从 stdin 读）
-  local target="$1" what="$2" tmp
+  local target="$1" what="$2" tmp act
   tmp="$(mktemp)"
   cat > "$tmp"
   if [ -f "$target" ] && cmp -s "$tmp" "$target"; then
@@ -116,13 +128,15 @@ write_protected() {
     printf "  · %s 已是最新，未改动\n" "$what"
     return 0
   fi
+  if [ -f "$target" ]; then act="覆盖"; else act="新建"; fi
+  if ! ask_write "$act" "$what" "$target"; then
+    rm -f "$tmp"
+    SKIPPED=$((SKIPPED+1))
+    printf "  · %s **未写入**（未同意）\n" "$what"
+    return 0
+  fi
+  mkdir -p "$(dirname "$target")"
   if [ -f "$target" ]; then
-    if ! confirm_overwrite "$target" "$what"; then
-      rm -f "$tmp"
-      printf "  · %s **保留了你的版本**（未改动）：%s\n" "$what" "$target"
-      printf "    想用新版本：bash install_dsh_termux.sh --reset-config\n"
-      return 0
-    fi
     cp "$target" "$target.bak.$(date +%Y%m%d-%H%M%S)"
     printf "  · 已备份原文件 → %s.bak.*\n" "$target"
   fi
@@ -134,21 +148,24 @@ write_protected() {
 # 内嵌文件解包（幂等 + 写入保护）
 # -----------------------------------------------------------------------------
 extract_embedded() {
-  mkdir -p "$SHIM_DIR"
+  # 目录延迟到真正写入时再建 —— 一个文件都没同意，就不该留下目录
   _emit() {
     # $1=目标文件名  $2=分隔符  stdin=内容
-    local target="$SHIM_DIR/$1" tmp
+    local target="$SHIM_DIR/$1" tmp act
     tmp="$(mktemp)"
     cat > "$tmp"
     if [ -f "$target" ] && cmp -s "$tmp" "$target"; then
       rm -f "$tmp"
       return 0
     fi
-    if [ -f "$target" ] && ! confirm_overwrite "$target" "$1"; then
+    if [ -f "$target" ]; then act="覆盖"; else act="新建"; fi
+    if ! ask_write "$act" "$1" "$target"; then
       rm -f "$tmp"
-      printf "  · %s **保留了你的版本**（未改动）\n" "$1"
+      SKIPPED=$((SKIPPED+1))
+      printf "  · %s **未写入**（未同意）\n" "$1"
       return 0
     fi
+    mkdir -p "$SHIM_DIR"
     if [ -f "$target" ]; then
       cp "$target" "$target.bak.$(date +%Y%m%d-%H%M%S)"
     fi
@@ -1330,7 +1347,7 @@ const api = {
 module.exports = api;
 module.exports.default = api;
 __NODE_PTY_SHIM_CJS__
-  chmod +x "$SHIM_DIR/dsh-shim.js"
+  [ -f "$SHIM_DIR/dsh-shim.js" ] && chmod +x "$SHIM_DIR/dsh-shim.js" || true
 }
 
 echo "${BOLD}"
@@ -1341,7 +1358,11 @@ echo "${RST}"
 if [ "$EXTRACT_ONLY" = "1" ]; then
   say "仅解包内嵌文件 → $SHIM_DIR"
   extract_embedded
-  ok "已解包 6 个 shim 文件"
+  if [ "$SKIPPED" -gt 0 ]; then
+    warn "有 $SKIPPED 个文件未写入（你没有同意）"
+  else
+    ok "已解包 6 个 shim 文件"
+  fi
   exit 0
 fi
 
@@ -1747,6 +1768,11 @@ fi
 
 # ---------------------------------------------------------------- 6. 收尾
 echo
+if [ "$SKIPPED" -gt 0 ]; then
+  warn "有 $SKIPPED 个文件因未同意而未写入 —— dsh-termux 可能不完整。"
+  warn "重跑本脚本可再次询问；加 --yes 表示本次全部同意。"
+  echo
+fi
 if [ "${NO_KEY:-0}" = "1" ]; then
   cat <<'EOF'
 下一步：
