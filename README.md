@@ -1,10 +1,14 @@
 # termux-dsh
 
-**在安卓手机（Termux）上跑 DeepSeek Harness (dsh) —— 一个 `.sh` 文件，五堵墙全翻。**
+**在安卓手机（Termux）上跑 DeepSeek Harness (dsh) —— 一个 `.sh` 文件，五堵墙全翻，全程零编译。**
 
 dsh（DeepSeek Harness）是"给模型装上手脚"的 agent 框架：能读文件、写文件、跑命令、连续干活。
 官方**不支持安卓**，直接装会在启动时崩。这套方案把它在 Termux 上跑通了，并且**真机实测**：
 对话能回、bash 工具能执行命令、session 能落盘。
+
+和其它教程最大的不同：**不装编译器、不跑 `node-gyp`、不产生任何 `.node` 文件**。
+所有原生依赖都用纯 JS 实现替换掉了（原理和证据见 [为什么不用编译任何原生模块](#为什么不用编译任何原生模块)）。
+这应该是目前公开的、开箱即用的 dsh-on-Termux 零编译方案。
 
 ```bash
 bash install_dsh_termux.sh
@@ -15,6 +19,8 @@ bash install_dsh_termux.sh
 ## 目录
 
 - [30 秒上手](#30-秒上手)
+- [为什么不用编译任何原生模块](#为什么不用编译任何原生模块)
+- [已知限制（纯 JS 的代价）](#已知限制纯-js-的代价)
 - [⚠️ 必读注意事项](#️-必读注意事项)
 - [它长什么样](#它长什么样)
 - [五堵墙](#五堵墙)
@@ -31,8 +37,8 @@ bash install_dsh_termux.sh
 **前置**：手机上装了 [Termux](https://f-droid.org/packages/com.termux/)。
 
 ```bash
-# 1. 基础环境
-pkg install -y nodejs-lts git python build-essential
+# 1. 基础环境（不需要 build-essential / clang）
+pkg install -y nodejs-lts git python
 
 # 2. 装 dsh（只传一个 .sh 文件！~64KB，自包含）
 bash install_dsh_termux.sh
@@ -61,6 +67,92 @@ dsh web: http://127.0.0.1:3080/?token=ScV--0EE0aUTwGbZsxlu4YBmnKqWkPQ1_mJQhAvY96
 
 配置是**覆盖层**（`~/.dsh-shim/free-models.yml`），`dsh-termux` 会自动加 `--patch`，
 所以 **web / headless / tui 三个 profile 全部生效**，也不会被 dsh 升级冲掉。
+
+---
+
+## 为什么不用编译任何原生模块
+
+绝大多数「在 Termux 上跑 XX」的教程，第一步都是 `pkg install build-essential`，
+然后对着 `node-gyp` 的编译日志等十分钟，最后大概率等来一个 `clang: error`。
+本方案从装到跑，**一次编译器都没调用过**。
+
+这不是"碰巧没编"，而是设计如此：dsh 用到的原生依赖，**没有一个是真正必需的**。
+
+### 三条可以直接复核的实测证据
+
+```bash
+# ① 整个 dsh 安装树里零个编译产物
+find ~/.dsh ~/.local/share/pnpm -name '*.node' 2>/dev/null | wc -l
+# → 0
+
+# ② 启动入口是纯 JS，不是二进制
+cat "$(command -v dsh-termux)"
+# → exec node --expose-internals ~/.dsh-shim/dsh-shim.js "$@"
+
+# ③ 补丁全部在 node_modules 之外，且都是文本文件
+ls ~/.dsh-shim/
+# → dsh-shim.js  dsh-require-hook.js  dsh-loader-hooks.mjs  flock-shim.mjs
+#    link-shim.cjs  node-pty-shim.cjs  dsh-termux  ...
+```
+
+第 ③ 点顺带解决了一个老问题：社区常见做法是直接改 `node_modules` 里的文件，
+`npm i -g` 一升级就被覆盖回去。这套方案**从头到尾不写过 `node_modules`**。
+
+### 替换清单
+
+| 原生依赖 | 它本来干什么 | 纯 JS 替代 | 代价 |
+|---|---|---|---|
+| `node-addon-require-builtin` | 不开 `--expose-internals` 时拿 Node 内部模块 | `--expose-internals` + `requireBuiltin()` | **无**，功能等价 |
+| `@deepseek-ai/node-addon-system/flock` | 跨进程文件锁 | `O_EXCL` 哨兵文件 | **无**，真跨进程互斥 |
+| `fs.link()` | 原子发布文件 | `open(dest, 'wx')` + 复制 | **无**，`EEXIST` 语义不变 |
+| `node-pty` | 交互式终端 | 管道替身 | 有，见下节 |
+| `sharp` | 图像处理 | `@img/sharp-wasm32` | 内存/速度，可接受 |
+
+四行「无」，一行「有代价」——代价那行不藏，见 [已知限制](#已知限制纯-js-的代价)。
+
+### 三种架构，同一个结论
+
+关键不是"安卓没有预编译包"，而是**预编译包存在与否，跟本方案的成败无关**。
+这决定了它不会被某一种机型限定：
+
+| 环境 | 原生包为什么用不了 | 本方案 |
+|---|---|---|
+| **Android 32 位**（`arm` / armeabi-v7a） | node-pty 压根没有 `linux-arm` 预编译包 | ✅ 纯 JS |
+| **Android 64 位**（`arm64`） | 有 `linux-arm64/pty.node`，但它是 **glibc** 链接的，Termux 是 **bionic**，照样加载失败 | ✅ 纯 JS |
+| **桌面 Linux / macOS** | 预编译包能正常加载 | ✅ shim 检测到可用就**不劫持**，直接用真模块 |
+
+最后一行很重要：这不是一个"为安卓写死"的补丁。
+在能加载真模块的平台上它自动让路，不影响上游行为。
+
+---
+
+## 已知限制（纯 JS 的代价）
+
+把话说前面：**这是降级运行，不是等效运行。**
+
+### ① 交互式终端降级成管道
+
+`spawnTerminal()` 拿到的是管道替身，不是真 PTY：
+
+- `isatty()` 为假 → 颜色、进度条、需要 TTY 的程序（`vim`、`less`、`top`）会退化
+- 不能 `resize`（没有 `TIOCSWINSZ`）
+- `Ctrl-C` 不会由 PTY 生成 `SIGINT`，得直接 kill 进程
+
+**但 agent 干活不受影响**：dsh 的 bash 工具走的是 `ctx.subprocess.spawn()`（管道），
+工具清单里也没有 terminal 工具。所以"让模型读文件、跑命令"这条主链路是完整的——
+实测的 `ls -la`、写文件、跑 Python，全部正常。
+
+真 PTY 的 Python 桥接方案在 [`docs/DSH_ON_TERMUX.md`](docs/DSH_ON_TERMUX.md) 里，
+需要 TUI 时再上，不是必需。
+
+### ② sharp 走 WASM
+
+图像处理比原生版慢、占内存更多。dsh 的日常对话用不到，只有处理图片时才相关。
+
+### ③ 打开的是 Node 内部模块
+
+`--expose-internals` 让 `internal/...` 可见，权限高于默认状态。
+只在跑 dsh 时用，别把这个标志的 node 拿去跑别的不可信代码（下方安全提醒有展开）。
 
 ---
 

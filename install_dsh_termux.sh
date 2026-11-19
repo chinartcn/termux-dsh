@@ -1530,14 +1530,14 @@ esac
 if command -v pkg >/dev/null 2>&1; then
   # 只在缺依赖时才装，已装则跳过（pkg 本身很快，但也没必要每次跑）
   MISSING_PKGS=""
-  for p in git python build-essential; do
+  for p in git python; do
     dpkg -s "$p" >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS $p"
   done
   if [ -n "$MISSING_PKGS" ]; then
     say "安装基础依赖:$MISSING_PKGS"
     pkg install -y $MISSING_PKGS 2>/dev/null || true
   else
-    ok "基础依赖已齐（git python build-essential）"
+    ok "基础依赖已齐（git python）"
   fi
 fi
 
